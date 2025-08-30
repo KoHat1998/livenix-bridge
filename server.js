@@ -4,19 +4,24 @@ require('dotenv').config();
 const PUBLIC_IP = process.env.PUBLIC_IP || 'YOUR.EC2.PUBLIC.IP'; // <- set in .env
 const PORT      = Number(process.env.PORT || 4000);
 
-const express = require('express');
-const http    = require('http');
-const cors    = require('cors');
+const express  = require('express');
+const wrtc     = require('wrtc'); // required by mediasoup (and for plain WebRTC bridge)
+const http     = require('http');
+const cors     = require('cors');
 const { Server } = require('socket.io');
 const mediasoup = require('mediasoup');
 
 const app = express();
 app.use(cors());
+app.use(express.json()); // <-- so POST JSON bodies are parsed
 app.get('/health', (_req, res) => res.json({ ok: true, service: 'livenix-bridge' }));
 
 const httpServer = http.createServer(app);
 const io = new Server(httpServer, { cors: { origin: '*' } });
 
+// ======================================================================
+// Mediasoup core (kept for the Socket.IO-based SFU flow you’ll build next)
+// ======================================================================
 let worker;
 let router;
 let broadcasterId = null; // socket.id of the single broadcaster (simple v1)
@@ -90,6 +95,70 @@ async function closePeer(socketId) {
   }
 }
 
+// ======================================================================
+// NEW: Plain WebRTC bridge (Broadcaster) – lets Flutter send a vanilla
+// SDP offer and receive an SDP answer, so the server gets the live tracks.
+// ======================================================================
+let pcBroadcaster = null;
+let broadcasterTracks = { audio: null, video: null };
+
+app.post('/webrtc/broadcast', async (req, res) => {
+  try {
+    const { sdp, type } = req.body || {};
+    if (!sdp || type !== 'offer') {
+      return res.status(400).json({ error: 'invalid offer' });
+    }
+
+    // Close existing broadcaster PC if any
+    if (pcBroadcaster) {
+      try { pcBroadcaster.close(); } catch {}
+      pcBroadcaster = null;
+      broadcasterTracks = { audio: null, video: null };
+    }
+
+    pcBroadcaster = new wrtc.RTCPeerConnection({
+      iceServers: [
+        { urls: ['stun:stun.l.google.com:19302'] },
+      ],
+    });
+
+    pcBroadcaster.oniceconnectionstatechange = () => {
+      console.log('[wrtc] broadcaster ICE:', pcBroadcaster.iceConnectionState);
+      if (['failed', 'disconnected', 'closed'].includes(pcBroadcaster.iceConnectionState)) {
+        try { pcBroadcaster.close(); } catch {}
+        pcBroadcaster = null;
+        broadcasterTracks = { audio: null, video: null };
+        // Inform connected clients that broadcaster is gone (optional)
+        io.sockets.sockets.forEach(s => s.emit('broadcaster-left'));
+      }
+    };
+
+    pcBroadcaster.ontrack = (evt) => {
+      const track = evt.track;
+      console.log('[wrtc] broadcaster ontrack:', track.kind);
+      if (track.kind === 'video') broadcasterTracks.video = track;
+      if (track.kind === 'audio') broadcasterTracks.audio = track;
+    };
+
+    await pcBroadcaster.setRemoteDescription({ type, sdp });
+
+    // We don’t send any local tracks back to the broadcaster; just answer.
+    const answer = await pcBroadcaster.createAnswer();
+    await pcBroadcaster.setLocalDescription(answer);
+
+    // Notify viewers that a new broadcast is available
+    io.sockets.sockets.forEach(s => s.emit('broadcaster-started'));
+
+    return res.json({ sdp: pcBroadcaster.localDescription.sdp, type: 'answer' });
+  } catch (e) {
+    console.error('/webrtc/broadcast error', e);
+    return res.status(500).json({ error: String(e) });
+  }
+});
+
+// ======================================================================
+// Socket.IO – existing SFU signaling endpoints (kept as-is)
+// ======================================================================
 io.on('connection', (socket) => {
   console.log('[io] connected', socket.id);
 
